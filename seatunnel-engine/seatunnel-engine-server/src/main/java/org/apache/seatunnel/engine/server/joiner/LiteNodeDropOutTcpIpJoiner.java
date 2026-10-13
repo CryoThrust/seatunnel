@@ -63,6 +63,12 @@ public class LiteNodeDropOutTcpIpJoiner extends TcpIpJoiner {
     private volatile boolean claimingMastership;
     private final JoinConfig joinConfig;
 
+    /**
+     * Tracks whether the "all candidates temporarily blacklisted, will retry" state has been
+     * logged.
+     */
+    private boolean retryLogEmitted;
+
     public LiteNodeDropOutTcpIpJoiner(Node node) {
         super(node);
         int tryCount = node.getProperties().getInteger(ClusterProperty.TCP_JOIN_PORT_TRY_COUNT);
@@ -155,11 +161,19 @@ public class LiteNodeDropOutTcpIpJoiner extends TcpIpJoiner {
                 }
 
                 // update for seatunnel, lite member can not become master node
-                if (isAllBlacklisted(possibleAddresses) && !node.isLiteMember()) {
-                    logger.fine(
-                            "This node will assume master role since none of the possible members accepted join request.");
-                    clusterJoinManager.setThisMemberAsMaster();
-                    return;
+                if (isAllBlacklisted(possibleAddresses)) {
+                    if (node.isLiteMember()) {
+                        retryTemporaryBlacklistedAddresses(possibleAddresses);
+                        // A lite member can never claim mastership, so skip the redundant claim
+                        // attempt and the master-address reset below, which would otherwise emit a
+                        // spurious WARN if the node joins while we wait in the retry step.
+                        continue;
+                    } else {
+                        logger.fine(
+                                "This node will assume master role since none of the possible members accepted join request.");
+                        clusterJoinManager.setThisMemberAsMaster();
+                        return;
+                    }
                 }
 
                 if (tryClaimMastership(possibleAddresses)) {
@@ -170,6 +184,39 @@ public class LiteNodeDropOutTcpIpJoiner extends TcpIpJoiner {
             }
         } catch (Throwable t) {
             logger.severe(t);
+        }
+    }
+
+    /**
+     * A lite member (worker) can never assume the master role, so when every candidate master
+     * address is temporarily blacklisted - typically because the master has not started yet - the
+     * join would otherwise deadlock until {@code hazelcast.max.join.seconds} elapses. Reuse the
+     * joiner's existing retry cadence to wait for a single interval, then clear only the temporary
+     * blacklist entries so that the next {@link #tryJoinAddresses(Collection)} call retries them.
+     *
+     * <p>Permanently blacklisted addresses are intentionally left untouched: {@link
+     * #unblacklist(Address)} only removes temporary (non-permanent) entries.
+     */
+    private void retryTemporaryBlacklistedAddresses(Collection<Address> possibleAddresses) {
+        if (!retryLogEmitted) {
+            retryLogEmitted = true;
+            logger.info(
+                    "This lite member cannot assume the master role and all candidate master "
+                            + "addresses are temporarily blacklisted. It will keep retrying until a "
+                            + "master becomes reachable or hazelcast.max.join.seconds elapses.");
+        }
+        if (logger.isFineEnabled()) {
+            logger.fine(
+                    "All candidate master addresses are temporarily blacklisted; "
+                            + "waiting for the master to come up before retrying.");
+        }
+        try {
+            clusterService.blockOnJoin(JOIN_RETRY_WAIT_TIME);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        for (Address address : possibleAddresses) {
+            unblacklist(address);
         }
     }
 

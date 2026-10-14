@@ -81,6 +81,72 @@ public class AsanaSourceFactoryTest {
     }
 
     @Test
+    public void testCustomBackoffMultiplierWithDefaultRetry() {
+        AsanaSourceParameter parameter =
+                buildRetryParameter(null, "retry_backoff_multiplier_ms", 2000);
+
+        Assertions.assertEquals(3, parameter.getRetry());
+        Assertions.assertEquals(2000, parameter.getRetryBackoffMultiplierMillis());
+        Assertions.assertEquals(10000, parameter.getRetryBackoffMaxMillis());
+    }
+
+    @Test
+    public void testCustomBackoffMaximumWithDefaultRetry() {
+        AsanaSourceParameter parameter = buildRetryParameter(null, "retry_backoff_max_ms", 3000);
+
+        Assertions.assertEquals(3, parameter.getRetry());
+        Assertions.assertEquals(100, parameter.getRetryBackoffMultiplierMillis());
+        Assertions.assertEquals(3000, parameter.getRetryBackoffMaxMillis());
+    }
+
+    @Test
+    public void testCustomBackoffWithExplicitRetry() {
+        AsanaSourceParameter parameter =
+                buildRetryParameter(3, "retry_backoff_multiplier_ms", 2000);
+
+        Assertions.assertEquals(3, parameter.getRetry());
+        Assertions.assertEquals(2000, parameter.getRetryBackoffMultiplierMillis());
+        Assertions.assertEquals(10000, parameter.getRetryBackoffMaxMillis());
+        Assertions.assertEquals(
+                3000,
+                buildRetryParameter(3, "retry_backoff_max_ms", 3000).getRetryBackoffMaxMillis());
+    }
+
+    @Test
+    public void testNoRetryStillPreservesCustomBackoff() {
+        AsanaSourceParameter parameter =
+                buildRetryParameter(0, "retry_backoff_multiplier_ms", 2000);
+
+        Assertions.assertEquals(0, parameter.getRetry());
+        Assertions.assertEquals(2000, parameter.getRetryBackoffMultiplierMillis());
+    }
+
+    @Test
+    public void testDefaultRetrySettings() {
+        AsanaSourceParameter parameter = buildRetryParameter(null, null, 0);
+
+        Assertions.assertEquals(3, parameter.getRetry());
+        Assertions.assertEquals(100, parameter.getRetryBackoffMultiplierMillis());
+        Assertions.assertEquals(10000, parameter.getRetryBackoffMaxMillis());
+    }
+
+    private AsanaSourceParameter buildRetryParameter(
+            Integer retry, String backoffOption, int value) {
+        Map<String, Object> config = new HashMap<>();
+        config.put("api_key", "test-token");
+        config.put("project_gid", "12345");
+        if (retry != null) {
+            config.put("retry", retry);
+        }
+        if (backoffOption != null) {
+            config.put(backoffOption, value);
+        }
+        AsanaSourceParameter parameter = new AsanaSourceParameter();
+        parameter.buildWithConfig(ReadonlyConfig.fromMap(config));
+        return parameter;
+    }
+
+    @Test
     public void testBlankApiKeyValidation() {
         HashMap<String, Object> configMap = new HashMap<>();
         configMap.put("api_key", "   ");

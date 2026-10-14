@@ -188,6 +188,59 @@ class LiteNodeDropOutTcpIpJoinerTest {
         }
     }
 
+    /** A reachable master must stay excluded when its address is permanently blacklisted. */
+    @Test
+    void retryMustNotClearAPermanentBlacklistEvenWhenTheMasterIsReachable() throws Exception {
+        String clusterName = TestUtils.getClusterName("LiteNodeDropOutTcpIpJoinerTest_permanent");
+        int masterPort = TestUtils.getAvailablePort();
+        int workerPort = TestUtils.getAvailablePort();
+        Address masterAddress = new Address(HOST, masterPort);
+        HazelcastInstanceImpl master = startNode(newConfig(clusterName, masterPort), null);
+        AtomicReference<HazelcastInstanceImpl> unexpectedWorker = new AtomicReference<>();
+        try {
+            Config workerConfig = newConfig(clusterName, workerPort, HOST + ":" + masterPort);
+            workerConfig.setLiteMember(true);
+            workerConfig.setProperty("hazelcast.max.join.seconds", "15");
+            Assertions.assertThrows(
+                    IllegalStateException.class,
+                    () -> {
+                        String instanceName =
+                                HazelcastInstanceFactory.createInstanceName(workerConfig);
+                        HazelcastInstanceProxy proxy =
+                                (HazelcastInstanceProxy)
+                                        HazelcastInstanceFactory.newHazelcastInstance(
+                                                workerConfig,
+                                                instanceName,
+                                                new DefaultNodeContext() {
+                                                    @Override
+                                                    public Joiner createJoiner(Node node) {
+                                                        return new LiteNodeDropOutTcpIpJoiner(
+                                                                node) {
+                                                            @Override
+                                                            public void doJoin() {
+                                                                // AbstractJoiner.join clears old
+                                                                // entries before
+                                                                // doJoin, so inject the permanent
+                                                                // exclusion here.
+                                                                blacklist(masterAddress, true);
+                                                                super.doJoin();
+                                                            }
+                                                        };
+                                                    }
+                                                });
+                        unexpectedWorker.set(proxy.getOriginal());
+                    });
+            Assertions.assertTrue(master.node.getClusterService().isJoined());
+            Assertions.assertTrue(master.node.isMaster());
+            Assertions.assertEquals(1, master.node.getClusterService().getMembers().size());
+        } finally {
+            if (unexpectedWorker.get() != null) {
+                unexpectedWorker.get().shutdown();
+            }
+            master.shutdown();
+        }
+    }
+
     /**
      * A joiner that counts down the given latch whenever an address is blacklisted, so tests can
      * deterministically wait for the worker to reach the temporary-blacklist state.

@@ -17,6 +17,9 @@
 
 package org.apache.seatunnel.connectors.seatunnel.jdbc.sink;
 
+import org.apache.seatunnel.shade.com.fasterxml.jackson.databind.JsonNode;
+import org.apache.seatunnel.shade.com.fasterxml.jackson.databind.node.ObjectNode;
+
 import org.apache.seatunnel.api.configuration.ReadonlyConfig;
 import org.apache.seatunnel.api.configuration.util.ConfigValidator;
 import org.apache.seatunnel.api.configuration.util.OptionRule;
@@ -46,9 +49,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 class JdbcSinkFactoryTest {
 
@@ -252,6 +257,171 @@ class JdbcSinkFactoryTest {
         System.out.println("ODCS_STUDY " + json);
     }
 
+    @Test
+    void testOdcsStudyKeepsUnsupportedContractObligations() throws Exception {
+        assertAdditionalObligations(
+                "logical-number-only",
+                ODCS_STUDY_CONTRACT.replace(",\"physicalType\":\"DECIMAL(18,4)\"", ""),
+                "DECIMAL_MAPPING_UNAVAILABLE");
+        assertAdditionalObligations(
+                "key-position-missing",
+                ODCS_STUDY_CONTRACT.replace(",\"primaryKeyPosition\":1", ""),
+                "KEY_POSITION_UNAVAILABLE");
+        assertAdditionalObligations(
+                "key-position-duplicate",
+                ODCS_STUDY_CONTRACT.replace("\"primaryKeyPosition\":2", "\"primaryKeyPosition\":1"),
+                "KEY_POSITION_AMBIGUOUS");
+        ObjectNode nested = JsonUtils.parseObject(ODCS_STUDY_CONTRACT);
+        ((ObjectNode) nested.path("schema").get(0))
+                .withArray("properties")
+                .add(
+                        JsonUtils.parseObject(
+                                "{\"name\":\"details\",\"logicalType\":\"array\","
+                                        + "\"items\":{\"logicalType\":\"string\"}}"));
+        assertAdditionalObligations("nested-array", nested.toString(), "NESTED_TYPE_UNSUPPORTED");
+        ObjectNode quality = JsonUtils.parseObject(ODCS_STUDY_CONTRACT);
+        ((ObjectNode) quality.path("schema").get(0))
+                .withArray("quality")
+                .add(
+                        JsonUtils.parseObject(
+                                "{\"type\":\"text\",\"description\":\"Rows must be unique\"}"));
+        assertAdditionalObligations(
+                "quality-obligation", quality.toString(), "QUALITY_UNSUPPORTED");
+        ObjectNode sla = JsonUtils.parseObject(ODCS_STUDY_CONTRACT);
+        sla.withArray("slaProperties")
+                .add(
+                        JsonUtils.parseObject(
+                                "{\"property\":\"freshness\",\"value\":24,\"unit\":\"hours\"}"));
+        assertAdditionalObligations("sla-obligation", sla.toString(), "SLA_UNSUPPORTED");
+    }
+
+    @Test
+    void testOdcsStudyIdentityConflictSurvivesSerialization() throws Exception {
+        String changed = ODCS_STUDY_CONTRACT.replace("DECIMAL(18,4)", "DECIMAL(20,4)");
+        ObjectNode original = JsonUtils.parseObject(ODCS_STUDY_CONTRACT);
+        ObjectNode replacement = JsonUtils.parseObject(changed);
+        Assertions.assertEquals(original.path("id"), replacement.path("id"));
+        Assertions.assertEquals(original.path("version"), replacement.path("version"));
+        Map<String, Object> result = odcsEnvelope("same-identity-different-bytes", changed);
+        List<Map<String, Object>> findings =
+                Collections.singletonList(
+                        odcsFinding(
+                                "CONTRACT_IDENTITY_CONFLICT",
+                                "id/version",
+                                odcsDigest(ODCS_STUDY_CONTRACT),
+                                odcsDigest(changed)));
+        result.put("scope", "identity-only");
+        result.put(
+                "outcome",
+                odcsDigest(ODCS_STUDY_CONTRACT).equals(odcsDigest(changed))
+                        ? "compatible"
+                        : "validation-error");
+        result.put("findings", findings);
+        ObjectNode serialized = JsonUtils.parseObject(JsonUtils.toJsonString(result));
+        Assertions.assertEquals("validation-error", serialized.path("outcome").asText());
+        Assertions.assertNotEquals(
+                serialized.path("findings").get(0).path("expected"),
+                serialized.path("findings").get(0).path("observed"));
+        Assertions.assertEquals(odcsDigest(changed), serialized.path("contractDigest").asText());
+        System.out.println("ODCS_STUDY " + serialized);
+    }
+
+    @Test
+    void testOdcsStudyAggregationNeverHidesUnknownObligations() {
+        Assertions.assertEquals(
+                "compatible", aggregateStudyOutcomes(Arrays.asList("compatible", "compatible")));
+        Assertions.assertEquals(
+                "unsupported", aggregateStudyOutcomes(Arrays.asList("compatible", "unsupported")));
+        Assertions.assertEquals(
+                "incompatible",
+                aggregateStudyOutcomes(Arrays.asList("unsupported", "incompatible")));
+        Assertions.assertEquals(
+                "validation-error",
+                aggregateStudyOutcomes(Arrays.asList("incompatible", "validation-error")));
+        Assertions.assertEquals("unsupported", aggregateStudyOutcomes(Collections.emptyList()));
+    }
+
+    private static String aggregateStudyOutcomes(List<String> outcomes) {
+        if (outcomes.contains("validation-error")) return "validation-error";
+        if (outcomes.contains("incompatible")) return "incompatible";
+        if (outcomes.isEmpty() || outcomes.contains("unsupported")) return "unsupported";
+        return "compatible";
+    }
+
+    /** Test-only known-obligation projection; not an ODCS parser or complete validator. */
+    private static void assertAdditionalObligations(String name, String contract, String reason)
+            throws Exception {
+        ObjectNode document = JsonUtils.parseObject(contract);
+        List<Map<String, Object>> findings = new ArrayList<>();
+        JsonNode table = document.path("schema").get(0);
+        Set<Integer> keyPositions = new HashSet<>();
+        for (JsonNode property : table.path("properties")) {
+            String field = "orders." + property.path("name").asText();
+            String type = property.path("logicalType").asText();
+            if ("number".equals(type) && !property.hasNonNull("physicalType")) {
+                findings.add(
+                        odcsFinding(
+                                "DECIMAL_MAPPING_UNAVAILABLE",
+                                field,
+                                "explicit physical decimal precision/scale",
+                                type));
+            }
+            if (Arrays.asList("object", "array", "map", "vector").contains(type)) {
+                findings.add(
+                        odcsFinding(
+                                "NESTED_TYPE_UNSUPPORTED", field, "supported scalar type", type));
+            }
+            if (property.path("primaryKey").asBoolean()) {
+                int position = property.path("primaryKeyPosition").asInt(-1);
+                if (position < 1) {
+                    findings.add(
+                            odcsFinding(
+                                    "KEY_POSITION_UNAVAILABLE",
+                                    field,
+                                    "positive primaryKeyPosition",
+                                    position));
+                } else if (!keyPositions.add(position)) {
+                    findings.add(
+                            odcsFinding(
+                                    "KEY_POSITION_AMBIGUOUS",
+                                    field,
+                                    "unique primaryKeyPosition",
+                                    position));
+                }
+            }
+        }
+        if (!table.path("quality").isMissingNode() && table.path("quality").size() > 0) {
+            findings.add(
+                    odcsFinding(
+                            "QUALITY_UNSUPPORTED",
+                            "orders.quality",
+                            "row-level evaluation",
+                            table.path("quality")));
+        }
+        if (document.path("slaProperties").size() > 0) {
+            findings.add(
+                    odcsFinding(
+                            "SLA_UNSUPPORTED",
+                            "slaProperties",
+                            "time/operational evaluation",
+                            document.path("slaProperties")));
+        }
+        Assertions.assertTrue(
+                findings.stream().anyMatch(f -> reason.equals(f.get("reason"))), name);
+        Map<String, Object> result = odcsEnvelope(name, contract);
+        result.put("scope", "additional-contract-obligations-only");
+        result.put("outcome", findings.isEmpty() ? "compatible" : "unsupported");
+        result.put("observed", odcsSnapshot(odcsTable(odcsColumns(18, 4), "orders", false)));
+        result.put("findings", findings);
+        result.put("actualTargetOutcome", "unsupported");
+        result.put("actualTargetReason", "TARGET_NOT_OBSERVED");
+        ObjectNode serialized = JsonUtils.parseObject(JsonUtils.toJsonString(result));
+        Assertions.assertEquals("unsupported", serialized.path("outcome").asText());
+        Assertions.assertTrue(serialized.path("findings").toString().contains(reason));
+        Assertions.assertEquals(odcsDigest(contract), serialized.path("contractDigest").asText());
+        System.out.println("ODCS_STUDY " + serialized);
+    }
+
     private static List<Column> odcsColumns(int precision, int scale) {
         return new ArrayList<>(
                 Arrays.asList(
@@ -306,24 +476,34 @@ class JdbcSinkFactoryTest {
     }
 
     private static Map<String, Object> odcsEnvelope(String fixture) throws Exception {
+        return odcsEnvelope(fixture, ODCS_STUDY_CONTRACT);
+    }
+
+    private static Map<String, Object> odcsEnvelope(String fixture, String contract)
+            throws Exception {
+        ObjectNode document = JsonUtils.parseObject(contract);
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("resultFormatVersion", "study-1");
         result.put("sourceRevision", "39c74ce48b0fb5e0318326b8d57a42c7380c40c8");
         result.put("fixture", fixture);
-        result.put("standardVersion", "v3.2.0");
-        result.put("contractId", "orders-study");
-        result.put("contractVersion", "1.0.0");
-        StringBuilder digest = new StringBuilder();
-        for (byte value :
-                MessageDigest.getInstance("SHA-256")
-                        .digest(ODCS_STUDY_CONTRACT.getBytes(StandardCharsets.UTF_8))) {
-            digest.append(String.format("%02x", value & 0xff));
-        }
-        result.put("contractDigest", digest.toString());
+        result.put("standardVersion", document.path("apiVersion").asText());
+        result.put("contractId", document.path("id").asText());
+        result.put("contractVersion", document.path("version").asText());
+        result.put("contractDigest", odcsDigest(contract));
         result.put("boundary", "T/upstream_catalog_table");
         result.put("namePolicy", "exact-case");
         result.put("decimalPolicy", "producer-to-consumer-range");
         return result;
+    }
+
+    private static String odcsDigest(String contract) throws Exception {
+        StringBuilder digest = new StringBuilder();
+        for (byte value :
+                MessageDigest.getInstance("SHA-256")
+                        .digest(contract.getBytes(StandardCharsets.UTF_8))) {
+            digest.append(String.format("%02x", value & 0xff));
+        }
+        return digest.toString();
     }
 
     // This evaluator is a test-only specification of the manually mapped scalar fixture,

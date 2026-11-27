@@ -18,7 +18,7 @@ The test-only output is a JSON-compatible attribute map, serialized as one `ODCS
 - Boundary, copied table/field/type/precision/scale/nullability/key attributes.
 - Individual reason/field/expected/observed findings; scalar-subset outcome; explicitly unevaluated capabilities; separate actual-target outcome.
 
-The contract is manually mapped. No general ODCS parsing or schema-validation claim is made. The standard version is `v3.2.0`; contract `orders-study` version `1.0.0` has exact-byte SHA-256 `b8656bc586b1e7a18804020b2b7bea54a7d008d7697e154fab27c5f1f470d6ef`. JSON whitespace changes that digest. This does not implement the identity registry or reject same-ID/version conflicts.
+The contract is manually mapped. No general ODCS parsing or schema-validation claim is made. The standard version is `v3.2.0`; contract `orders-study` version `1.0.0` has exact-byte SHA-256 `b8656bc586b1e7a18804020b2b7bea54a7d008d7697e154fab27c5f1f470d6ef`. JSON whitespace changes that digest. A new test-only identity comparison keeps different digests under the same ID/version visible as a validation error; it is not an identity registry or runtime admission rule.
 
 ## Executed observations
 
@@ -30,7 +30,9 @@ The contract is manually mapped. No general ODCS parsing or schema-validation cl
 | Planned decimal SQL | Typed `(18,4)`; explicit sink `(18,2)`; preserved MySQL source `(16,2)`; typed `(70,35)` | Real builder emits `(18,4)`, `(18,2)`, `(16,2)`, `(65,30)` respectively. |
 | Planned nullable key SQL | Index generation disabled/enabled | Real builder emits NULL/NOT NULL respectively, while input metadata stays nullable. |
 
-This totals 26 observation records, not 26 independent test methods. The two selected test classes contain 32 tests including existing tests: all passed, with zero failures, errors or skips. The JDBC reactor `verify` and formatting passed on JDK 11. The module's integration tests were skipped by its existing build configuration; no database or end-to-end CDC test was run.
+The original study produced 26 observation records. The follow-up adds seven contract-input records: logical number without physical decimal metadata, missing key position, duplicate key position, nested array, quality rule, SLA, and same-ID/version content conflict. The first six retain their actual unsupported requirement and reason in serialized output; the last preserves both exact-byte digests and a validation-error outcome. They project only known requirements from constructed JSON fixtures, not arbitrary ODCS documents. A separate aggregation test specifies that validation errors and known mismatches take priority, unsupported requirements cannot disappear into a compatible result, and an empty observation set is unsupported.
+
+These are 33 observation records, not independent test methods. The two selected test classes now contain 35 tests including existing tests. Formatting and the JDBC reactor `verify` are run on JDK 11; the module's integration tests are skipped by its existing build configuration. No database or end-to-end CDC test is claimed.
 
 Reproduce from this branch with the project's supported Maven installation and JDK 11:
 
@@ -52,8 +54,8 @@ The SQL-builder observations are labeled `planned-ddl-only`, with `contractEvalu
 ## Limits and decisions still required
 
 - Scalar compatibility is not whole-contract compatibility. String character capacity remains unevaluated because `Column.columnLength` describes bytes, not a portable character count. Unsigned bounds, timezone/charset/collation, nested types, quality/uniqueness and SLA remain unsupported. The fixture key comparison does not prove data uniqueness.
-- The proposed aggregation is: a known mismatch wins as incompatible; otherwise any unsupported obligation yields unsupported; only a fully evaluated declared subset can be compatible. Observation/identity/contract-validation errors remain separate from type incompatibility. The tests assert the scalar subset and preserve exclusions; they do not implement whole-contract aggregation.
-- A logical-number-only contract, identity conflicts, missing/ambiguous key positions and unsupported obligations supplied as actual contract inputs still need dedicated fixtures once the mapping/result contract is agreed. This is not a claim that every row of the earlier conceptual matrix is implemented.
+- The proposed aggregation is: validation errors remain distinct; a known mismatch wins over unsupported; otherwise any unsupported obligation yields unsupported; only a fully evaluated declared subset can be compatible. The test-only reducer specifies those priorities but does not connect a production whole-contract evaluator.
+- Logical-number-only, identity conflict, missing/ambiguous key positions, nested array, quality and SLA inputs now have dedicated fixtures. Their shapes were checked against the pinned ODCS v3.2.0 schema definitions (`f0bdad95346905d500be5ef4b2c2d9b1d95223b7`); no schema validator or general parser was run. This is not a claim that every row or every possible input in the earlier conceptual matrix is implemented.
 - The maps are mutable test fixtures, not a production immutable result API. Before implementation, settle immutable ownership, per-obligation paths/reason codes, and whether the existing dry-run reporting layer can carry results without changing its SPI.
 - No automatic enforcement, checkpoint/recovery semantics, remote registry, or pre-DDL safety guarantee is established. Do not infer these from successful unit tests.
 

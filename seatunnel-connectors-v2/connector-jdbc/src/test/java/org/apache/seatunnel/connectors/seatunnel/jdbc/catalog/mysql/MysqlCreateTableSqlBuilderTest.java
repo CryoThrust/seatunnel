@@ -28,9 +28,11 @@ import org.apache.seatunnel.api.table.catalog.TableIdentifier;
 import org.apache.seatunnel.api.table.catalog.TablePath;
 import org.apache.seatunnel.api.table.catalog.TableSchema;
 import org.apache.seatunnel.api.table.type.BasicType;
+import org.apache.seatunnel.api.table.type.DecimalType;
 import org.apache.seatunnel.api.table.type.LocalTimeType;
 import org.apache.seatunnel.api.table.type.PrimitiveByteArrayType;
 import org.apache.seatunnel.api.table.type.SeaTunnelDataType;
+import org.apache.seatunnel.common.utils.JsonUtils;
 import org.apache.seatunnel.connectors.seatunnel.jdbc.internal.dialect.DatabaseIdentifier;
 import org.apache.seatunnel.connectors.seatunnel.jdbc.internal.dialect.mysql.MySqlTypeConverter;
 
@@ -42,12 +44,118 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 public class MysqlCreateTableSqlBuilderTest {
+
+    /** Executes only the SQL builder, not CREATE TABLE or a database metadata read. */
+    @Test
+    public void testOdcsStudySeparatesTypedDecimalFromPlannedNativeSql() {
+        assertOdcsPlannedType("typed-decimal", 18, 4, null, null, "DECIMAL(18,4)");
+        assertOdcsPlannedType("explicit-sink-type", 18, 4, "DECIMAL(18,2)", null, "DECIMAL(18,2)");
+        assertOdcsPlannedType(
+                "preserved-source-type", 18, 4, null, "DECIMAL(16,2)", "DECIMAL(16,2)");
+        assertOdcsPlannedType("converter-normalization", 70, 35, null, null, "DECIMAL(65,30)");
+    }
+
+    private void assertOdcsPlannedType(
+            String fixture,
+            int precision,
+            int scale,
+            String sinkType,
+            String sourceType,
+            String expected) {
+        Column amount =
+                PhysicalColumn.of(
+                        "amount",
+                        new DecimalType(precision, scale),
+                        (long) precision,
+                        scale,
+                        false,
+                        null,
+                        null,
+                        sinkType,
+                        sourceType);
+        TablePath path = TablePath.of("target_db", "orders");
+        CatalogTable table =
+                CatalogTable.of(
+                        TableIdentifier.of("mysql", "target_db", "orders"),
+                        TableSchema.builder().column(amount).build(),
+                        new HashMap<>(),
+                        Collections.emptyList(),
+                        null);
+        String sql =
+                MysqlCreateTableSqlBuilder.builder(
+                                path, table, MySqlTypeConverter.DEFAULT_INSTANCE, false)
+                        .build(DatabaseIdentifier.MYSQL);
+        Assertions.assertTrue(sql.contains("`amount` " + expected + " NOT NULL"), sql);
+        Map<String, Object> observation = new LinkedHashMap<>();
+        observation.put("resultFormatVersion", "study-1");
+        observation.put("sourceRevision", "39c74ce48b0fb5e0318326b8d57a42c7380c40c8");
+        observation.put("fixture", fixture);
+        observation.put("boundary", "planned-ddl-only");
+        observation.put("contractEvaluation", "not-performed");
+        observation.put("typedDecimal", amount.getDataType().toString());
+        observation.put("sourceType", sourceType);
+        observation.put("sinkType", sinkType);
+        observation.put("plannedNativeType", expected);
+        observation.put("sql", sql);
+        observation.put("actualTargetOutcome", "unsupported");
+        observation.put("actualTargetReason", "TARGET_NOT_OBSERVED");
+        System.out.println("ODCS_STUDY " + JsonUtils.toJsonString(observation));
+    }
+
+    @Test
+    public void testOdcsStudyNullableKeyDependsOnIndexCreation() {
+        CatalogTable table =
+                CatalogTable.of(
+                        TableIdentifier.of("mysql", "target_db", "orders"),
+                        TableSchema.builder()
+                                .column(
+                                        PhysicalColumn.of(
+                                                "order_id",
+                                                BasicType.LONG_TYPE,
+                                                19L,
+                                                true,
+                                                null,
+                                                null))
+                                .primaryKey(
+                                        PrimaryKey.of(
+                                                "pk_orders", Collections.singletonList("order_id")))
+                                .build(),
+                        new HashMap<>(),
+                        Collections.emptyList(),
+                        null);
+        for (boolean createIndex : Arrays.asList(false, true)) {
+            String sql =
+                    MysqlCreateTableSqlBuilder.builder(
+                                    table.getTablePath(),
+                                    table,
+                                    MySqlTypeConverter.DEFAULT_INSTANCE,
+                                    createIndex)
+                            .build(DatabaseIdentifier.MYSQL);
+            Assertions.assertTrue(
+                    sql.contains("`order_id` BIGINT " + (createIndex ? "NOT NULL" : "NULL")), sql);
+            Assertions.assertEquals(createIndex, sql.contains("PRIMARY KEY (`order_id`)"));
+            Assertions.assertTrue(table.getTableSchema().getColumns().get(0).isNullable());
+            Map<String, Object> observation = new LinkedHashMap<>();
+            observation.put("resultFormatVersion", "study-1");
+            observation.put("sourceRevision", "39c74ce48b0fb5e0318326b8d57a42c7380c40c8");
+            observation.put("fixture", "nullable-key-create-index-" + createIndex);
+            observation.put("boundary", "planned-ddl-only");
+            observation.put("contractEvaluation", "not-performed");
+            observation.put("typedNullable", true);
+            observation.put("plannedNullable", !createIndex);
+            observation.put("sql", sql);
+            observation.put("actualTargetOutcome", "unsupported");
+            observation.put("actualTargetReason", "TARGET_NOT_OBSERVED");
+            System.out.println("ODCS_STUDY " + JsonUtils.toJsonString(observation));
+        }
+    }
 
     private static final PrintStream CONSOLE = System.out;
 

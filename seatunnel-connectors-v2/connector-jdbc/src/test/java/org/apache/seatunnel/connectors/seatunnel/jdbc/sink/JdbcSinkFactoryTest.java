@@ -22,6 +22,7 @@ import org.apache.seatunnel.api.configuration.util.ConfigValidator;
 import org.apache.seatunnel.api.configuration.util.OptionRule;
 import org.apache.seatunnel.api.configuration.util.OptionValidationException;
 import org.apache.seatunnel.api.table.catalog.CatalogTable;
+import org.apache.seatunnel.api.table.catalog.Column;
 import org.apache.seatunnel.api.table.catalog.ConstraintKey;
 import org.apache.seatunnel.api.table.catalog.PhysicalColumn;
 import org.apache.seatunnel.api.table.catalog.PrimaryKey;
@@ -31,18 +32,454 @@ import org.apache.seatunnel.api.table.connector.TableSink;
 import org.apache.seatunnel.api.table.factory.TableSinkFactoryContext;
 import org.apache.seatunnel.api.table.schema.SchemaChangeType;
 import org.apache.seatunnel.api.table.type.BasicType;
+import org.apache.seatunnel.api.table.type.DecimalType;
+import org.apache.seatunnel.common.utils.JsonUtils;
+import org.apache.seatunnel.connectors.seatunnel.jdbc.config.JdbcSinkOptions;
 import org.apache.seatunnel.connectors.seatunnel.jdbc.exception.JdbcConnectorException;
 
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 class JdbcSinkFactoryTest {
+
+    // Test-only, manually mapped scalar contract. No ODCS parser or runtime hook is installed.
+    private static final String ODCS_STUDY_CONTRACT =
+            "{\"apiVersion\":\"v3.2.0\",\"kind\":\"DataContract\","
+                    + "\"id\":\"orders-study\",\"version\":\"1.0.0\",\"name\":\"Orders study\",\"status\":\"draft\","
+                    + "\"schema\":[{\"name\":\"orders\",\"physicalName\":\"orders\",\"logicalType\":\"object\",\"properties\":["
+                    + "{\"name\":\"tenant_id\",\"logicalType\":\"integer\",\"physicalType\":\"BIGINT\",\"required\":true,\"primaryKey\":true,\"primaryKeyPosition\":1},"
+                    + "{\"name\":\"order_id\",\"logicalType\":\"integer\",\"physicalType\":\"BIGINT\",\"required\":true,\"primaryKey\":true,\"primaryKeyPosition\":2},"
+                    + "{\"name\":\"amount\",\"logicalType\":\"number\",\"physicalType\":\"DECIMAL(18,4)\",\"required\":true},"
+                    + "{\"name\":\"note\",\"logicalType\":\"string\",\"physicalType\":\"VARCHAR(128)\",\"required\":false}]}]}";
+
+    @Test
+    void testOdcsStudyScalarObservations() throws Exception {
+        assertOdcsStudy("matching", odcsColumns(18, 4), "orders", false, false, "compatible", "");
+        assertOdcsStudy(
+                "decimal-narrower", odcsColumns(16, 2), "orders", false, false, "compatible", "");
+        assertOdcsStudy(
+                "decimal-integer-overflow",
+                odcsColumns(18, 2),
+                "orders",
+                false,
+                false,
+                "incompatible",
+                "DECIMAL_INTEGER_CAPACITY");
+        assertOdcsStudy(
+                "decimal-scale-overflow",
+                odcsColumns(16, 6),
+                "orders",
+                false,
+                false,
+                "incompatible",
+                "DECIMAL_SCALE");
+
+        List<Column> columns = odcsColumns(18, 4);
+        columns.add(PhysicalColumn.of("extra", BasicType.STRING_TYPE, 128L, true, null, null));
+        assertOdcsStudy("extra-allowed", columns, "orders", true, false, "compatible", "");
+        assertOdcsStudy(
+                "extra-rejected", columns, "orders", false, false, "incompatible", "EXTRA_FIELD");
+        columns = odcsColumns(18, 4);
+        columns.remove(3);
+        assertOdcsStudy(
+                "missing-nullable-field",
+                columns,
+                "orders",
+                false,
+                false,
+                "incompatible",
+                "MISSING_FIELD");
+        columns = odcsColumns(18, 4);
+        columns.set(
+                1, PhysicalColumn.of("renamed_order", BasicType.LONG_TYPE, 19L, false, null, null));
+        assertOdcsStudy(
+                "renamed-required-field",
+                columns,
+                "orders",
+                false,
+                false,
+                "incompatible",
+                "MISSING_FIELD");
+        columns = odcsColumns(18, 4);
+        columns.set(1, PhysicalColumn.of("order_id", BasicType.LONG_TYPE, 19L, true, null, null));
+        assertOdcsStudy(
+                "nullable-required-field",
+                columns,
+                "orders",
+                false,
+                false,
+                "incompatible",
+                "NULLABILITY");
+        assertOdcsStudy(
+                "table-case-difference",
+                odcsColumns(18, 4),
+                "Orders",
+                false,
+                false,
+                "incompatible",
+                "TABLE_NAME");
+        columns = odcsColumns(18, 4);
+        columns.set(1, PhysicalColumn.of("Order_ID", BasicType.LONG_TYPE, 19L, false, null, null));
+        assertOdcsStudy(
+                "column-case-difference",
+                columns,
+                "orders",
+                false,
+                false,
+                "incompatible",
+                "MISSING_FIELD");
+        assertOdcsStudy(
+                "key-order",
+                odcsColumns(18, 4),
+                "orders",
+                false,
+                true,
+                "incompatible",
+                "PRIMARY_KEY_ORDER");
+        columns = odcsColumns(18, 4);
+        columns.set(2, PhysicalColumn.of("amount", BasicType.STRING_TYPE, 128L, false, null, null));
+        assertOdcsStudy(
+                "wrong-type-family",
+                columns,
+                "orders",
+                false,
+                false,
+                "incompatible",
+                "TYPE_FAMILY");
+        columns = odcsColumns(18, 4);
+        columns.set(
+                2, PhysicalColumn.of("amount", new DecimalType(18, 4), 16L, 2, false, null, null));
+        assertOdcsStudy(
+                "conflicting-decimal-metadata",
+                columns,
+                "orders",
+                false,
+                false,
+                "unsupported",
+                "DECIMAL_METADATA_CONFLICT");
+        columns = odcsColumns(18, 4);
+        columns.set(3, PhysicalColumn.of("note", BasicType.STRING_TYPE, 128L, false, null, null));
+        assertOdcsStudy("non-null-note", columns, "orders", false, false, "compatible", "");
+    }
+
+    @Test
+    void testOdcsStudySourceAndTransformedSnapshotsStaySeparate() throws Exception {
+        // Constructed schema pairs only: this does not execute a transform or validate row values.
+        assertOdcsStudy(
+                "pair-a-source",
+                odcsColumns(18, 2),
+                "orders",
+                false,
+                false,
+                "incompatible",
+                "DECIMAL_INTEGER_CAPACITY",
+                "S/source_schema");
+        assertOdcsStudy(
+                "pair-a-transformed",
+                odcsColumns(18, 4),
+                "orders",
+                false,
+                false,
+                "compatible",
+                "",
+                "T/upstream_catalog_table");
+        assertOdcsStudy(
+                "pair-b-source",
+                odcsColumns(16, 2),
+                "orders",
+                false,
+                false,
+                "compatible",
+                "",
+                "S/source_schema");
+        assertOdcsStudy(
+                "pair-b-transformed",
+                odcsColumns(18, 2),
+                "orders",
+                false,
+                false,
+                "incompatible",
+                "DECIMAL_INTEGER_CAPACITY",
+                "T/upstream_catalog_table");
+    }
+
+    @Test
+    void testOdcsStudyFactoryChangesAreSeparateObservations() throws Exception {
+        CatalogTable incoming = odcsTable(odcsColumns(18, 4), "orders", false);
+        Map<String, Object> before = odcsSnapshot(incoming);
+        Map<String, Object> config = baseConfig();
+        config.put("url", "jdbc:mysql://localhost:3306/target_db");
+        config.put("driver", "com.mysql.cj.jdbc.Driver");
+        config.put("database", "target_db");
+        config.put("table", "target_orders");
+        config.put(JdbcSinkOptions.TABLE_PREFIX.key(), "p_");
+        config.put(JdbcSinkOptions.TABLE_SUFFIX.key(), "_archive");
+        config.put("primary_keys", Arrays.asList("order_id", "tenant_id"));
+        JdbcSink sink = createJdbcSink(config, incoming);
+        CatalogTable writeTable = sink.getWriteCatalogTable().orElseThrow(AssertionError::new);
+        Assertions.assertEquals("orders", incoming.getTablePath().getTableName());
+        Assertions.assertEquals(
+                Arrays.asList("tenant_id", "order_id"),
+                incoming.getTableSchema().getPrimaryKey().getColumnNames());
+        Assertions.assertEquals(
+                "p_target_orders_archive", writeTable.getTablePath().getTableName());
+        Assertions.assertEquals("target_db", writeTable.getTablePath().getDatabaseName());
+        Assertions.assertEquals(
+                Arrays.asList("order_id", "tenant_id"),
+                writeTable.getTableSchema().getPrimaryKey().getColumnNames());
+        Map<String, Object> result = odcsEnvelope("factory-name-key-overrides");
+        result.put("incoming", before);
+        result.put("sinkWrite", odcsSnapshot(writeTable));
+        result.put("actualTargetOutcome", "unsupported");
+        result.put("actualTargetReason", "TARGET_NOT_OBSERVED");
+        String json = JsonUtils.toJsonString(result);
+        Assertions.assertEquals(
+                result.get("contractDigest"),
+                JsonUtils.parseObject(json).get("contractDigest").asText());
+        Assertions.assertEquals(
+                "orders-study", JsonUtils.parseObject(json).get("contractId").asText());
+        Assertions.assertEquals(before, odcsSnapshot(incoming));
+        System.out.println("ODCS_STUDY " + json);
+    }
+
+    private static List<Column> odcsColumns(int precision, int scale) {
+        return new ArrayList<>(
+                Arrays.asList(
+                        PhysicalColumn.of("tenant_id", BasicType.LONG_TYPE, 19L, false, null, null),
+                        PhysicalColumn.of("order_id", BasicType.LONG_TYPE, 19L, false, null, null),
+                        PhysicalColumn.of(
+                                "amount",
+                                new DecimalType(precision, scale),
+                                (long) precision,
+                                scale,
+                                false,
+                                null,
+                                null),
+                        PhysicalColumn.of("note", BasicType.STRING_TYPE, 128L, true, null, null)));
+    }
+
+    private static CatalogTable odcsTable(List<Column> columns, String name, boolean reverseKey) {
+        return CatalogTable.of(
+                TableIdentifier.of("study", "source_db", name),
+                TableSchema.builder()
+                        .columns(columns)
+                        .primaryKey(
+                                PrimaryKey.of(
+                                        "pk_orders",
+                                        reverseKey
+                                                ? Arrays.asList("order_id", "tenant_id")
+                                                : Arrays.asList("tenant_id", "order_id")))
+                        .build(),
+                new HashMap<>(),
+                new ArrayList<>(),
+                null);
+    }
+
+    private static Map<String, Object> odcsSnapshot(CatalogTable table) {
+        Map<String, Object> snapshot = new LinkedHashMap<>();
+        snapshot.put("table", table.getTablePath().getFullName());
+        snapshot.put(
+                "primaryKey",
+                new ArrayList<>(table.getTableSchema().getPrimaryKey().getColumnNames()));
+        List<Map<String, Object>> fields = new ArrayList<>();
+        for (Column column : table.getTableSchema().getColumns()) {
+            Map<String, Object> field = new LinkedHashMap<>();
+            field.put("name", column.getName());
+            field.put("type", column.getDataType().toString());
+            field.put("length", column.getColumnLength());
+            field.put("scale", column.getScale());
+            field.put("nullable", column.isNullable());
+            fields.add(field);
+        }
+        snapshot.put("fields", fields);
+        return snapshot;
+    }
+
+    private static Map<String, Object> odcsEnvelope(String fixture) throws Exception {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("resultFormatVersion", "study-1");
+        result.put("sourceRevision", "39c74ce48b0fb5e0318326b8d57a42c7380c40c8");
+        result.put("fixture", fixture);
+        result.put("standardVersion", "v3.2.0");
+        result.put("contractId", "orders-study");
+        result.put("contractVersion", "1.0.0");
+        StringBuilder digest = new StringBuilder();
+        for (byte value :
+                MessageDigest.getInstance("SHA-256")
+                        .digest(ODCS_STUDY_CONTRACT.getBytes(StandardCharsets.UTF_8))) {
+            digest.append(String.format("%02x", value & 0xff));
+        }
+        result.put("contractDigest", digest.toString());
+        result.put("boundary", "T/upstream_catalog_table");
+        result.put("namePolicy", "exact-case");
+        result.put("decimalPolicy", "producer-to-consumer-range");
+        return result;
+    }
+
+    // This evaluator is a test-only specification of the manually mapped scalar fixture,
+    // not an ODCS parser, extension point or runtime validator.
+    private void assertOdcsStudy(
+            String name,
+            List<Column> columns,
+            String tableName,
+            boolean allowExtras,
+            boolean reverseKey,
+            String expected,
+            String expectedReason)
+            throws Exception {
+        assertOdcsStudy(
+                name,
+                columns,
+                tableName,
+                allowExtras,
+                reverseKey,
+                expected,
+                expectedReason,
+                "T/upstream_catalog_table");
+    }
+
+    private void assertOdcsStudy(
+            String name,
+            List<Column> columns,
+            String tableName,
+            boolean allowExtras,
+            boolean reverseKey,
+            String expected,
+            String expectedReason,
+            String boundary)
+            throws Exception {
+        CatalogTable observed = odcsTable(columns, tableName, reverseKey);
+        TableSinkFactoryContext context =
+                new TableSinkFactoryContext(
+                        observed,
+                        ReadonlyConfig.fromMap(baseConfig()),
+                        getClass().getClassLoader());
+        List<Map<String, Object>> findings = new ArrayList<>();
+        if (!"orders".equals(context.getCatalogTable().getTablePath().getTableName())) {
+            findings.add(odcsFinding("TABLE_NAME", "table", "orders", tableName));
+        }
+        for (Column required : odcsColumns(18, 4)) {
+            Column actual =
+                    columns.stream()
+                            .filter(c -> c.getName().equals(required.getName()))
+                            .findFirst()
+                            .orElse(null);
+            if (actual == null) {
+                findings.add(odcsFinding("MISSING_FIELD", required.getName(), "present", "absent"));
+                continue;
+            }
+            if (!required.isNullable() && actual.isNullable()) {
+                findings.add(
+                        odcsFinding("NULLABILITY", required.getName(), "not-null", "nullable"));
+            }
+            if (required.getDataType().getSqlType() != actual.getDataType().getSqlType()) {
+                findings.add(
+                        odcsFinding(
+                                "TYPE_FAMILY",
+                                required.getName(),
+                                required.getDataType().toString(),
+                                actual.getDataType().toString()));
+                continue;
+            }
+            if (actual.getDataType() instanceof DecimalType) {
+                DecimalType decimal = (DecimalType) actual.getDataType();
+                if (!Long.valueOf(decimal.getPrecision()).equals(actual.getColumnLength())
+                        || !Integer.valueOf(decimal.getScale()).equals(actual.getScale())) {
+                    findings.add(
+                            odcsFinding(
+                                    "DECIMAL_METADATA_CONFLICT",
+                                    actual.getName(),
+                                    decimal.toString(),
+                                    actual.getColumnLength() + "," + actual.getScale()));
+                    continue;
+                }
+                if (decimal.getPrecision() - decimal.getScale() > 14) {
+                    findings.add(
+                            odcsFinding(
+                                    "DECIMAL_INTEGER_CAPACITY",
+                                    actual.getName(),
+                                    14,
+                                    decimal.getPrecision() - decimal.getScale()));
+                }
+                if (decimal.getScale() > 4) {
+                    findings.add(
+                            odcsFinding("DECIMAL_SCALE", actual.getName(), 4, decimal.getScale()));
+                }
+            }
+        }
+        if (!allowExtras) {
+            for (Column actual : columns) {
+                if (!Arrays.asList("tenant_id", "order_id", "amount", "note")
+                        .contains(actual.getName())) {
+                    findings.add(odcsFinding("EXTRA_FIELD", actual.getName(), "absent", "present"));
+                }
+            }
+        }
+        if (!Arrays.asList("tenant_id", "order_id")
+                .equals(
+                        context.getCatalogTable()
+                                .getTableSchema()
+                                .getPrimaryKey()
+                                .getColumnNames())) {
+            findings.add(
+                    odcsFinding(
+                            "PRIMARY_KEY_ORDER",
+                            "primary-key",
+                            Arrays.asList("tenant_id", "order_id"),
+                            context.getCatalogTable()
+                                    .getTableSchema()
+                                    .getPrimaryKey()
+                                    .getColumnNames()));
+        }
+        boolean incompatible =
+                findings.stream()
+                        .anyMatch(f -> !"DECIMAL_METADATA_CONFLICT".equals(f.get("reason")));
+        String outcome =
+                incompatible ? "incompatible" : findings.isEmpty() ? "compatible" : "unsupported";
+        Assertions.assertEquals(expected, outcome, name);
+        if (!expectedReason.isEmpty()) {
+            Assertions.assertTrue(
+                    findings.stream().anyMatch(f -> expectedReason.equals(f.get("reason"))), name);
+        }
+        Map<String, Object> result = odcsEnvelope(name);
+        result.put("boundary", boundary);
+        result.put("evidenceProvenance", "constructed-schema-fixture");
+        result.put("allowExtras", allowExtras);
+        result.put("observed", odcsSnapshot(context.getCatalogTable()));
+        result.put("scalarOutcome", outcome);
+        result.put("actualTargetOutcome", "unsupported");
+        result.put("actualTargetReason", "TARGET_NOT_OBSERVED");
+        result.put("findings", findings);
+        result.put(
+                "notEvaluated",
+                Arrays.asList(
+                        "string-character-capacity",
+                        "nested-types",
+                        "quality",
+                        "SLA",
+                        "actual-target-metadata"));
+        System.out.println("ODCS_STUDY " + JsonUtils.toJsonString(result));
+    }
+
+    private static Map<String, Object> odcsFinding(
+            String reason, String field, Object expected, Object observed) {
+        Map<String, Object> finding = new LinkedHashMap<>();
+        finding.put("reason", reason);
+        finding.put("field", field);
+        finding.put("expected", expected);
+        finding.put("observed", observed);
+        return finding;
+    }
 
     private final JdbcSinkFactory factory = new JdbcSinkFactory();
     private final OptionRule rule = factory.optionRule();
